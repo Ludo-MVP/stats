@@ -1,20 +1,24 @@
-name: Org Commit Insights (Pages)
+name: Org Commit Insights (Markdown + Pages)
 
 on:
   workflow_dispatch:
     inputs:
-      org:
-        description: "GitHub organization"
-        required: true
       weeks:
-        description: "Weeks to aggregate (4–5 ≈ month)"
+        description: "Weeks to aggregate (4 ~= 28 days, 5 ~= 35 days)"
         required: false
-        default: "5"
+        default: "24"
   schedule:
-    - cron: "0 6 * * 1" # weekly Monday 06:00 UTC
+    - cron: "0 6 * * 1" # every Monday 06:00 UTC
+    
+env:
+  ORG_NAME: Ludo-MVP
 
 permissions:
   contents: write
+
+concurrency:
+  group: org-commit-insights
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -26,95 +30,115 @@ jobs:
       - name: Verify gh is available
         run: gh --version
 
-      - name: Generate HTML report
+      - name: Generate Markdown report (all branches)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ORG="${{ inputs.org }}"
+          ORG="${ORG_NAME}"
           WEEKS="${{ inputs.weeks || '5' }}"
-          OUT="docs/insights/commits.html"
+          OUT="docs/insights/commits.md"
 
           mkdir -p docs/insights
 
+          # Exclude forks and archived repos (remove filters if you want them included)
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
             --jq '.[] | select(.fork==false and .archived==false) | .full_name'
           )
 
           total=0
+          processed=0
+          skipped=0
           rows=""
 
           for repo in "${REPOS[@]}"; do
             data=""
+
+            # /stats endpoints may return 202 while GitHub generates stats
             for i in {1..8}; do
-              # Берём статус + тело, чтобы отличать 200 от 202
               resp="$(gh api -i "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
               status="$(printf "%s" "$resp" | head -n1 | awk '{print $2}')"
               body="$(printf "%s" "$resp" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
-          
-              if [[ "$status" == "200" ]]; then
+
+              if [[ "${status}" == "200" ]]; then
                 data="$body"
                 break
               fi
-          
-              # 202 = GitHub ещё считает статистику, ждём и пробуем снова
-              if [[ "$status" == "202" ]]; then
+
+              if [[ "${status}" == "202" ]]; then
                 sleep 3
                 continue
               fi
-          
-              # Любые другие статусы/ошибки — пропускаем репо
+
               data=""
               break
             done
-          
-            # Если не получили валидный массив — skip
-            [[ -z "$data" ]] && continue
-            [[ "$(echo "$data" | jq -r 'type' 2>/dev/null)" != "array" ]] && continue
-          
-            c="$(echo "$data" | jq -r --argjson n "$WEEKS" '[.[-($n):] | .[].total] | add // 0')"
+
+            # If not a JSON array, skip safely
+            if [[ -z "${data}" ]]; then
+              skipped=$((skipped+1))
+              continue
+            fi
+
+            jtype="$(echo "$data" | jq -r 'type' 2>/dev/null || echo "unknown")"
+            if [[ "${jtype}" != "array" ]]; then
+              skipped=$((skipped+1))
+              continue
+            fi
+
+            c="$(echo "$data" | jq -r --argjson n "$WEEKS" '[.[-($n):] | .[].total] | add // 0' 2>/dev/null || echo 0)"
             total=$((total + c))
-            rows="${rows}<tr><td>${repo}</td><td>${c}</td></tr>"
+            processed=$((processed+1))
+
+            # Markdown row
+            rows="${rows}| ${repo} | ${c} |
+"
           done
 
+          # Write markdown file
           cat > "$OUT" <<EOF
-          <!doctype html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <title>Org Commit Insights</title>
-            <style>
-              body { font-family: system-ui, sans-serif; padding: 32px; }
-              table { border-collapse: collapse; width: 100%; margin-top: 24px; }
-              th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
-              th { background: #f9fafb; }
-            </style>
-          </head>
-          <body>
-            <h1>Organization Commit Insights</h1>
-            <p><strong>Org:</strong> ${ORG}</p>
-            <p><strong>Period:</strong> last ${WEEKS} weeks (all branches)</p>
-            <p><strong>Total commits:</strong> ${total}</p>
+          # Organization Commit Insights
 
-            <table>
-              <thead>
-                <tr><th>Repository</th><th>Commits</th></tr>
-              </thead>
-              <tbody>
-                ${rows}
-              </tbody>
-            </table>
-          </body>
-          </html>
+          **Org:** ${ORG}  
+          **Period:** last ${WEEKS} weeks (all branches)  
+          **Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")
+
+          ## Summary
+          - **Total commits:** ${total}
+          - **Repositories counted:** ${processed}
+          - **Repositories skipped:** ${skipped}
+
+          ## Commits by repository
+          | Repository | Commits |
+          |-----------|--------:|
           EOF
 
+          # Append rows (even if empty)
+          printf "%s" "$rows" >> "$OUT"
+
+          # Ensure file ends with newline
+          echo "" >> "$OUT"
+
+          echo "Report written to $OUT"
+          head -n 30 "$OUT"
+
       - name: Commit & push report
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add docs/insights/commits.html
-          git commit -m "Update org commit insights" || exit 0
+
+          git add docs/insights/commits.md
+
+          # No changes -> no commit
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update org commit insights"
           git push
