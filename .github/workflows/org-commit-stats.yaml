@@ -1,0 +1,96 @@
+name: Org Commit Insights (Pages)
+
+on:
+  workflow_dispatch:
+    inputs:
+      org:
+        description: "GitHub organization"
+        required: true
+      weeks:
+        description: "Weeks to aggregate (4–5 ≈ month)"
+        required: false
+        default: "5"
+  schedule:
+    - cron: "0 6 * * 1" # weekly Monday 06:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup gh
+        uses: cli/cli@v2
+
+      - name: Generate HTML report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORG="${{ inputs.org }}"
+          WEEKS="${{ inputs.weeks || '5' }}"
+          OUT="docs/insights/commits.html"
+
+          mkdir -p docs/insights
+
+          mapfile -t REPOS < <(
+            gh api "orgs/${ORG}/repos?per_page=100" --paginate \
+            --jq '.[] | select(.fork==false and .archived==false) | .full_name'
+          )
+
+          total=0
+          rows=""
+
+          for repo in "${REPOS[@]}"; do
+            data="$(gh api "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
+            [[ "$data" == "null" || -z "$data" ]] && continue
+
+            c="$(echo "$data" | jq -r --argjson n "$WEEKS" '[.[-($n):] | .[].total] | add // 0')"
+            total=$((total + c))
+            rows="${rows}<tr><td>${repo}</td><td>${c}</td></tr>"
+          done
+
+          cat > "$OUT" <<EOF
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Org Commit Insights</title>
+            <style>
+              body { font-family: system-ui, sans-serif; padding: 32px; }
+              table { border-collapse: collapse; width: 100%; margin-top: 24px; }
+              th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
+              th { background: #f9fafb; }
+            </style>
+          </head>
+          <body>
+            <h1>Organization Commit Insights</h1>
+            <p><strong>Org:</strong> ${ORG}</p>
+            <p><strong>Period:</strong> last ${WEEKS} weeks (all branches)</p>
+            <p><strong>Total commits:</strong> ${total}</p>
+
+            <table>
+              <thead>
+                <tr><th>Repository</th><th>Commits</th></tr>
+              </thead>
+              <tbody>
+                ${rows}
+              </tbody>
+            </table>
+          </body>
+          </html>
+          EOF
+
+      - name: Commit & push report
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add docs/insights/commits.html
+          git commit -m "Update org commit insights" || exit 0
+          git push
