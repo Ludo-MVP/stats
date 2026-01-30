@@ -23,8 +23,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup gh
-        uses: cli/cli@latest
+      - name: Verify gh is available
+        run: gh --version
 
       - name: Generate HTML report
         env:
