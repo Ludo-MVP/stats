@@ -6,7 +6,7 @@ on:
       weeks:
         description: "Weeks to aggregate (4 ~= 28 days, 5 ~= 35 days)"
         required: false
-        default: "24"
+        default: "48"
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
@@ -45,13 +45,14 @@ jobs:
 
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
-            --jq '.[] | select(.fork==false and .archived==false) | .full_name'
+              --jq '.[] | select(.fork==false and .archived==false) | .full_name'
           )
 
           total=0
           processed=0
           skipped=0
 
+          # Write header
           {
             echo "# Organization Commit Insights"
             echo
@@ -67,11 +68,69 @@ jobs:
             echo "## Commits by repository"
             echo "| Repository | Commits |"
             echo "|-----------|--------:|"
-          } > "$OUT"
+          } > "${OUT}"
 
           for repo in "${REPOS[@]}"; do
             data=""
 
-            for _ in {1..8}; do
+            # /stats endpoints may return 202 while GitHub generates stats
+            for i in 1 2 3 4 5 6 7 8; do
               resp="$(gh api -i "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
-              status="$(printf "%s" "$resp" | head -n1 | a
+              status="$(printf "%s" "$resp" | head -n 1 | awk "{print \$2}")"
+              body="$(printf "%s" "$resp" | sed -n '1{/^\r\{0,1\}$/q};1,/\r\{0,1\}$/d;p')"
+
+              if [[ "${status}" == "200" ]]; then
+                data="${body}"
+                break
+              fi
+
+              if [[ "${status}" == "202" ]]; then
+                sleep 3
+                continue
+              fi
+
+              data=""
+              break
+            done
+
+            if [[ -z "${data}" ]]; then
+              skipped=$((skipped+1))
+              continue
+            fi
+
+            jtype="$(echo "${data}" | jq -r 'type' 2>/dev/null || echo unknown)"
+            if [[ "${jtype}" != "array" ]]; then
+              skipped=$((skipped+1))
+              continue
+            fi
+
+            c="$(echo "${data}" | jq -r --argjson n "${WEEKS}" '[.[-($n):] | .[].total] | add // 0' 2>/dev/null || echo 0)"
+
+            total=$((total + c))
+            processed=$((processed+1))
+
+            printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
+          done
+
+          # Patch summary lines without awk single-quote blocks
+          perl -0777 -i -pe "s/- \\*\\*Total commits:\\*\\* \\(computing\\...\\)/- **Total commits:** ${total}/g; s/- \\*\\*Repositories counted:\\*\\* \\(computing\\...\\)/- **Repositories counted:** ${processed}/g; s/- \\*\\*Repositories skipped:\\*\\* \\(computing\\...\\)/- **Repositories skipped:** ${skipped}/g" "${OUT}"
+
+          echo "Report written to ${OUT}"
+          head -n 40 "${OUT}"
+
+      - name: Commit & push report
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git add docs/insights/commits.md
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update org commit insights"
+          git push
