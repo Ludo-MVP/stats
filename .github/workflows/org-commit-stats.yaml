@@ -8,8 +8,8 @@ on:
         required: false
         default: "24"
   schedule:
-    - cron: "0 5 * * 1" # every Monday 06:00 UTC
-    
+    - cron: "0 6 * * 1" # every Monday 06:00 UTC
+
 env:
   ORG_NAME: Ludo-MVP
 
@@ -43,7 +43,6 @@ jobs:
 
           mkdir -p docs/insights
 
-          # Exclude forks and archived repos (remove filters if you want them included)
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
             --jq '.[] | select(.fork==false and .archived==false) | .full_name'
@@ -52,93 +51,27 @@ jobs:
           total=0
           processed=0
           skipped=0
-          rows=""
+
+          {
+            echo "# Organization Commit Insights"
+            echo
+            echo "**Org:** ${ORG}  "
+            echo "**Period:** last ${WEEKS} weeks (all branches)  "
+            echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo
+            echo "## Summary"
+            echo "- **Total commits:** (computing...)"
+            echo "- **Repositories counted:** (computing...)"
+            echo "- **Repositories skipped:** (computing...)"
+            echo
+            echo "## Commits by repository"
+            echo "| Repository | Commits |"
+            echo "|-----------|--------:|"
+          } > "$OUT"
 
           for repo in "${REPOS[@]}"; do
             data=""
 
-            # /stats endpoints may return 202 while GitHub generates stats
-            for i in {1..8}; do
+            for _ in {1..8}; do
               resp="$(gh api -i "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
-              status="$(printf "%s" "$resp" | head -n1 | awk '{print $2}')"
-              body="$(printf "%s" "$resp" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
-
-              if [[ "${status}" == "200" ]]; then
-                data="$body"
-                break
-              fi
-
-              if [[ "${status}" == "202" ]]; then
-                sleep 3
-                continue
-              fi
-
-              data=""
-              break
-            done
-
-            # If not a JSON array, skip safely
-            if [[ -z "${data}" ]]; then
-              skipped=$((skipped+1))
-              continue
-            fi
-
-            jtype="$(echo "$data" | jq -r 'type' 2>/dev/null || echo "unknown")"
-            if [[ "${jtype}" != "array" ]]; then
-              skipped=$((skipped+1))
-              continue
-            fi
-
-            c="$(echo "$data" | jq -r --argjson n "$WEEKS" '[.[-($n):] | .[].total] | add // 0' 2>/dev/null || echo 0)"
-            total=$((total + c))
-            processed=$((processed+1))
-
-            # Markdown row
-            rows="${rows}| ${repo} | ${c} |
-"
-          done
-
-          # Write markdown file
-          cat > "$OUT" <<EOF
-          # Organization Commit Insights
-
-          **Org:** ${ORG}  
-          **Period:** last ${WEEKS} weeks (all branches)  
-          **Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")
-
-          ## Summary
-          - **Total commits:** ${total}
-          - **Repositories counted:** ${processed}
-          - **Repositories skipped:** ${skipped}
-
-          ## Commits by repository
-          | Repository | Commits |
-          |-----------|--------:|
-          EOF
-
-          # Append rows (even if empty)
-          printf "%s" "$rows" >> "$OUT"
-
-          # Ensure file ends with newline
-          echo "" >> "$OUT"
-
-          echo "Report written to $OUT"
-          head -n 30 "$OUT"
-
-      - name: Commit & push report
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-
-          git add docs/insights/commits.md
-
-          # No changes -> no commit
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update org commit insights"
-          git push
+              status="$(printf "%s" "$resp" | head -n1 | a
