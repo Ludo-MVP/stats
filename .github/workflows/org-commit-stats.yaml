@@ -48,9 +48,33 @@ jobs:
           rows=""
 
           for repo in "${REPOS[@]}"; do
-            data="$(gh api "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
-            [[ "$data" == "null" || -z "$data" ]] && continue
-
+            data=""
+            for i in {1..8}; do
+              # Берём статус + тело, чтобы отличать 200 от 202
+              resp="$(gh api -i "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
+              status="$(printf "%s" "$resp" | head -n1 | awk '{print $2}')"
+              body="$(printf "%s" "$resp" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
+          
+              if [[ "$status" == "200" ]]; then
+                data="$body"
+                break
+              fi
+          
+              # 202 = GitHub ещё считает статистику, ждём и пробуем снова
+              if [[ "$status" == "202" ]]; then
+                sleep 3
+                continue
+              fi
+          
+              # Любые другие статусы/ошибки — пропускаем репо
+              data=""
+              break
+            done
+          
+            # Если не получили валидный массив — skip
+            [[ -z "$data" ]] && continue
+            [[ "$(echo "$data" | jq -r 'type' 2>/dev/null)" != "array" ]] && continue
+          
             c="$(echo "$data" | jq -r --argjson n "$WEEKS" '[.[-($n):] | .[].total] | add // 0')"
             total=$((total + c))
             rows="${rows}<tr><td>${repo}</td><td>${c}</td></tr>"
