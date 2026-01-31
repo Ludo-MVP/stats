@@ -11,7 +11,10 @@ on:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
 env:
+  # Org login for API
   ORG_NAME: Ludo-MVP
+  # Display name in report (fixed)
+  ORG_LABEL: Ludo Labs AG
 
 permissions:
   contents: write
@@ -45,15 +48,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install matplotlib
 
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
           COMPUTE_LOC="true"
           if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
             COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
           fi
 
           if [[ "${COMPUTE_LOC}" == "true" ]]; then
+            sudo apt-get update -y
             sudo apt-get install -y cloc
           fi
 
@@ -61,7 +62,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           ORG_LOGIN: ${{ env.ORG_NAME }}
-          ORG_LABEL: "Ludo Labs AG"
+          ORG_LABEL: ${{ env.ORG_LABEL }}
           SELF_REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           COMPUTE_LOC_INPUT: ${{ inputs.compute_loc || 'true' }}
@@ -69,265 +70,250 @@ jobs:
         run: |
           set -euo pipefail
 
+          # LOC default ON: schedule always true; manual uses input default true
           COMPUTE_LOC="true"
           if [[ "${EVENT_NAME}" != "schedule" ]]; then
             COMPUTE_LOC="${COMPUTE_LOC_INPUT}"
           fi
-          export COMPUTE_LOC
 
-          python - <<'PY'
-          import os, json, subprocess
+          OUT_MD="commits.md"
+          OUT_PNG="commits_1500d.png"
+          DATES_FILE=".commit_dates_1500d.txt"
+          ACTIVE_FILE=".active_repos.txt"
+          : > "${DATES_FILE}"
+          : > "${ACTIVE_FILE}"
+
+          SINCE_30D_ISO="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          SINCE_30D_DATE="$(date -u -d '30 days ago' +%Y-%m-%d)"
+          SINCE_1500D_ISO="$(date -u -d '1500 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+          # 1) List repos safely (one per line), no JSON decoding of huge arrays
+          mapfile -t REPOS < <(
+            gh api "orgs/${ORG_LOGIN}/repos?per_page=100" --paginate \
+              --jq '.[] | select(.fork==false and .archived==false) | .full_name' \
+              | grep -v -F "${SELF_REPO}" \
+              | grep -v -iE '/stats$' \
+              | grep -v -i 'backup' \
+              || true
+          )
+
+          processed=0
+          skipped=0
+          total_commits=0
+          active_repos=0
+
+          total_loc=0
+          loc_counted=0
+          loc_skipped=0
+
+          # Helper: count commits since date on default branch using REST commits endpoint.
+          # Uses per_page=1 and Link rel="last" (page=N) => total N.
+          get_commit_count_30d() {
+            local repo="$1"
+            local since_iso="$2"
+
+            # -i includes headers; body is JSON list
+            local resp status headers body last_page
+            resp="$(gh api -i "repos/${repo}/commits?since=${since_iso}&per_page=1" 2>/dev/null || true)"
+            status="$(printf "%s" "${resp}" | head -n 1 | awk '{print $2}')"
+
+            if [[ "${status}" != "200" ]]; then
+              echo ""
+              return 1
+            fi
+
+            headers="$(printf "%s" "${resp}" | awk 'BEGIN{p=1} /^\r?$/{p=0} {if(p)print}')"
+            body="$(printf "%s" "${resp}" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
+
+            # If Link: ... rel="last" exists, extract page=NUM
+            last_page="$(printf "%s\n" "${headers}" | tr -d '\r' | awk -F'[, ]' '
+              BEGIN{n=""}
+              /rel="last"/{
+                for(i=1;i<=NF;i++){
+                  if($i ~ /page=[0-9]+/){
+                    match($i, /page=[0-9]+/)
+                    n=substr($i, RSTART+5, RLENGTH-5)
+                  }
+                }
+              }
+              END{print n}
+            ')"
+
+            if [[ -n "${last_page}" ]] && [[ "${last_page}" =~ ^[0-9]+$ ]]; then
+              echo "${last_page}"
+              return 0
+            fi
+
+            # No "last" link => either 0 or 1 item (because per_page=1)
+            # If body is "[]", count 0 else 1.
+            if echo "${body}" | grep -q '^\s*\[\s*\]\s*$'; then
+              echo "0"
+            else
+              echo "1"
+            fi
+            return 0
+          }
+
+          # Helper: LOC for repo (default branch) using shallow clone + cloc
+          get_repo_loc() {
+            local repo="$1"
+            local dir="__repo_tmp_${RANDOM}_${RANDOM}"
+
+            git clone --quiet --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" "${dir}" || return 1
+
+            local loc
+            loc="$(cloc "${dir}" --json --quiet 2>/dev/null | jq -r '.SUM.code // 0' || echo 0)"
+
+            rm -rf "${dir}"
+            echo "${loc}"
+          }
+
+          # Helper: dump commit dates since 1500d for repo (default branch) to file
+          dump_commit_dates_1500d() {
+            local repo="$1"
+            local since_iso="$2"
+
+            # This prints one ISO date per line (commit.committer.date)
+            gh api "repos/${repo}/commits?since=${since_iso}&per_page=100" --paginate \
+              --jq '.[].commit.committer.date' 2>/dev/null || true
+          }
+
+          # 2) Compute 30d commits and active repos list
+          for repo in "${REPOS[@]}"; do
+            # Light throttle to be nice to API
+            sleep 0.2
+
+            c="$(get_commit_count_30d "${repo}" "${SINCE_30D_ISO}" || true)"
+            if [[ -z "${c}" ]] || ! [[ "${c}" =~ ^[0-9]+$ ]]; then
+              skipped=$((skipped+1))
+              continue
+            fi
+
+            processed=$((processed+1))
+            total_commits=$((total_commits + c))
+
+            if (( c > 0 )); then
+              active_repos=$((active_repos+1))
+              echo "${repo}" >> "${ACTIVE_FILE}"
+
+              if [[ "${COMPUTE_LOC}" == "true" ]]; then
+                loc="$(get_repo_loc "${repo}" || true)"
+                if [[ -z "${loc}" ]] || ! [[ "${loc}" =~ ^[0-9]+$ ]]; then
+                  loc_skipped=$((loc_skipped+1))
+                else
+                  loc_counted=$((loc_counted+1))
+                  total_loc=$((total_loc + loc))
+                fi
+              fi
+            fi
+          done
+
+          # 3) Collect 1500d commit dates for active repos only
+          if [[ -s "${ACTIVE_FILE}" ]]; then
+            while IFS= read -r repo; do
+              [[ -z "${repo}" ]] && continue
+              # Slight throttle; pagination can be heavier
+              sleep 0.3
+              dump_commit_dates_1500d "${repo}" "${SINCE_1500D_ISO}" >> "${DATES_FILE}"
+            done < "${ACTIVE_FILE}"
+          fi
+
+          # 4) Build chart from dates file
+          cat > __chart.py <<'PY'
+          import os
           from datetime import datetime, timedelta, timezone, date
           from collections import defaultdict
 
-          ORG_LOGIN = os.environ["ORG_LOGIN"]
-          ORG_LABEL = os.environ.get("ORG_LABEL", ORG_LOGIN)
-          GH_TOKEN = os.environ["GH_TOKEN"]
-          SELF_REPO = (os.environ.get("SELF_REPO") or "").lower()
-          COMPUTE_LOC = (os.environ.get("COMPUTE_LOC") or "true").lower() == "true"
+          import matplotlib.pyplot as plt
 
-          OUT_MD = "commits.md"
-          OUT_PNG = "commits_1500d.png"
-
-          since_30d_dt = datetime.now(timezone.utc) - timedelta(days=30)
-          since_30d_date = since_30d_dt.date().isoformat()
-          since_30d_iso = f"{since_30d_date}T00:00:00Z"
-
-          start_1500d_dt = datetime.now(timezone.utc) - timedelta(days=1500)
-          since_1500d_iso = start_1500d_dt.isoformat().replace("+00:00", "Z")
-
-          def sh(cmd, check=True):
-            return subprocess.run(cmd, check=check, text=True, capture_output=True)
-
-          def gh(cmd, check=True):
-            r = sh(["gh"] + cmd, check=check)
-            return r.stdout
-
-          def gh_graphql(query: str, variables: dict):
-            out = gh(["api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"])
-            return json.loads(out)
-
-          def list_accessible_repos():
-            # Critical fix: use --jq with --paginate to emit one repo per line (safe streaming output).
-            # This avoids JSON "Extra data" errors from concatenated pages.
-            out = gh([
-              "api",
-              "installation/repositories?per_page=100",
-              "--paginate",
-              "--jq",
-              ".repositories[].full_name"
-            ])
-            repos = [line.strip() for line in out.splitlines() if line.strip()]
-
-            filtered = []
-            for full in repos:
-              if "/" not in full:
-                continue
-              name = full.split("/", 1)[1]
-
-              if SELF_REPO and full.lower() == SELF_REPO:
-                continue
-              if name.lower() == "stats" or full.lower().endswith("/stats"):
-                continue
-              if "backup" in name.lower() or "backup" in full.lower():
-                continue
-
-              filtered.append(full)
-
-            # de-dup and stable order
-            return sorted(set(filtered))
-
-          Q_COMMITS_30D = r"""
-          query($owner:String!, $name:String!, $since:GitTimestamp!) {
-            repository(owner:$owner, name:$name) {
-              defaultBranchRef {
-                target {
-                  ... on Commit {
-                    history(since:$since) { totalCount }
-                  }
-                }
-              }
-            }
-          }
-          """
-
-          Q_HISTORY_PAGE = r"""
-          query($owner:String!, $name:String!, $since:GitTimestamp!, $after:String) {
-            repository(owner:$owner, name:$name) {
-              defaultBranchRef {
-                target {
-                  ... on Commit {
-                    history(since:$since, first:100, after:$after) {
-                      pageInfo { hasNextPage endCursor }
-                      nodes { committedDate }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          """
-
-          def commits_last_30d(repo_full: str) -> int:
-            owner, name = repo_full.split("/", 1)
-            data = gh_graphql(Q_COMMITS_30D, {"owner": owner, "name": name, "since": since_30d_iso})
-            repo = (data.get("data") or {}).get("repository") or {}
-            dbr = repo.get("defaultBranchRef")
-            if not dbr:
-              return 0
-            target = dbr.get("target") or {}
-            hist = target.get("history") or {}
-            return int(hist.get("totalCount") or 0)
-
-          def loc_repo(repo_full: str) -> int:
-            tmp = f"__repo_tmp_{os.getpid()}_{abs(hash(repo_full))}"
-            url = f"https://x-access-token:{GH_TOKEN}@github.com/{repo_full}.git"
-            try:
-              sh(["git", "clone", "--quiet", "--depth", "1", url, tmp], check=True)
-            except subprocess.CalledProcessError:
-              sh(["rm", "-rf", tmp], check=False)
-              return 0
-
-            try:
-              r = sh(["cloc", tmp, "--json", "--quiet"], check=True)
-              j = json.loads(r.stdout or "{}")
-              return int(((j.get("SUM") or {}).get("code")) or 0)
-            except Exception:
-              return 0
-            finally:
-              sh(["rm", "-rf", tmp], check=False)
+          dates_file = ".commit_dates_1500d.txt"
+          out_png = "commits_1500d.png"
 
           def week_key(d: date) -> str:
             monday = d - timedelta(days=d.weekday())
             return monday.isoformat()
 
-          def add_repo_1500d(repo_full: str, weekly: dict):
-            owner, name = repo_full.split("/", 1)
-            after = None
-            while True:
-              data = gh_graphql(Q_HISTORY_PAGE, {"owner": owner, "name": name, "since": since_1500d_iso, "after": after})
-              repo = (data.get("data") or {}).get("repository") or {}
-              dbr = repo.get("defaultBranchRef")
-              if not dbr:
-                return
-              target = dbr.get("target") or {}
-              hist = target.get("history") or {}
-              nodes = hist.get("nodes") or []
+          weekly = defaultdict(int)
 
-              for n in nodes:
-                cd = n.get("committedDate")
-                if cd:
-                  d = date.fromisoformat(cd[:10])
+          if os.path.exists(dates_file):
+            with open(dates_file, "r", encoding="utf-8") as f:
+              for line in f:
+                s = line.strip()
+                if not s:
+                  continue
+                # Expected ISO like 2026-01-31T12:34:56Z
+                try:
+                  d = date.fromisoformat(s[:10])
                   weekly[week_key(d)] += 1
+                except Exception:
+                  pass
 
-              pi = hist.get("pageInfo") or {}
-              if not pi.get("hasNextPage"):
-                return
-              after = pi.get("endCursor")
+          end_dt = datetime.now(timezone.utc)
+          start_dt = end_dt - timedelta(days=1500)
+          end_date = end_dt.date()
+          start_date = start_dt.date()
 
-          def render_chart(weekly: dict):
-            import matplotlib.pyplot as plt
+          start_monday = start_date - timedelta(days=start_date.weekday())
+          end_monday = end_date - timedelta(days=end_date.weekday())
 
-            end_dt = datetime.now(timezone.utc)
-            start_dt = end_dt - timedelta(days=1500)
+          labels = []
+          values = []
+          cur = start_monday
+          while cur <= end_monday:
+            k = cur.isoformat()
+            labels.append(k)
+            values.append(int(weekly.get(k, 0)))
+            cur += timedelta(days=7)
 
-            end_date = end_dt.date()
-            start_date = start_dt.date()
+          plt.figure(figsize=(12, 4))
+          plt.plot(range(len(values)), values)
 
-            start_monday = start_date - timedelta(days=start_date.weekday())
-            end_monday = end_date - timedelta(days=end_date.weekday())
-
-            labels, values = [], []
-            cur = start_monday
-            while cur <= end_monday:
-              k = cur.isoformat()
-              labels.append(k)
-              values.append(int(weekly.get(k, 0)))
-              cur += timedelta(days=7)
-
-            plt.figure(figsize=(12, 4))
-            plt.plot(range(len(values)), values)
-
-            step = max(1, len(labels) // 12)
-            plt.xticks(
-              range(0, len(labels), step),
-              [labels[i] for i in range(0, len(labels), step)],
-              rotation=45,
-              ha="right"
-            )
-            plt.ylabel("Commits (weekly)")
-            plt.title("Org commits trend (last 1500 days, weekly, active repos, default branches)")
-            plt.tight_layout()
-            plt.savefig(OUT_PNG, dpi=150)
-
-          def main():
-            repos = list_accessible_repos()
-
-            processed = 0
-            skipped = 0
-            total_commits = 0
-            active_repos = []
-
-            for repo in repos:
-              try:
-                c = commits_last_30d(repo)
-                processed += 1
-                total_commits += c
-                if c > 0:
-                  active_repos.append(repo)
-              except Exception:
-                skipped += 1
-
-            total_loc = 0
-            loc_counted = 0
-            loc_skipped = 0
-            if COMPUTE_LOC and active_repos:
-              for repo in active_repos:
-                loc = loc_repo(repo)
-                if loc > 0:
-                  total_loc += loc
-                  loc_counted += 1
-                else:
-                  loc_skipped += 1
-
-            weekly = defaultdict(int)
-            for repo in active_repos:
-              try:
-                add_repo_1500d(repo, weekly)
-              except Exception:
-                pass
-
-            if not weekly:
-              import matplotlib.pyplot as plt
-              plt.figure(figsize=(12, 4))
-              plt.plot([0], [0])
-              plt.title("Org commits (last 1500 days) — no data")
-              plt.tight_layout()
-              plt.savefig(OUT_PNG, dpi=150)
-            else:
-              render_chart(weekly)
-
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            with open(OUT_MD, "w", encoding="utf-8") as f:
-              f.write("# Organization Commit Insights\n\n")
-              f.write(f"**Org:** {ORG_LABEL}  \n")
-              f.write(f"**Commits period:** last 30 days (since {since_30d_date}, all branches)  \n")
-              f.write("**LOC:** computed weekly for repos with commits > 0  \n" if COMPUTE_LOC else "**LOC:** not computed  \n")
-              f.write(f"**Generated:** {now}\n\n")
-
-              f.write("## Summary\n\n")
-              f.write(f"- **Total commits (30d):** {total_commits}\n")
-              f.write(f"- **Repositories counted (commits):** {processed}\n")
-              f.write(f"- **Repositories skipped (commits):** {skipped}\n")
-              f.write(f"- **Active repos (commits > 0):** {len(active_repos)}\n")
-              f.write(f"- **Total LOC (active repos only):** {total_loc}\n")
-              f.write(f"- **Repositories counted (LOC):** {loc_counted}\n")
-              f.write(f"- **Repositories skipped (LOC):** {loc_skipped}\n\n")
-              f.write(f"![Org commits trend (last 1500 days)]({OUT_PNG})\n")
-
-          if __name__ == "__main__":
-            main()
+          step = max(1, len(labels) // 12)
+          plt.xticks(
+            range(0, len(labels), step),
+            [labels[i] for i in range(0, len(labels), step)],
+            rotation=45,
+            ha="right"
+          )
+          plt.ylabel("Commits (weekly)")
+          title = "Org commits trend (last 1500 days, weekly, active repos, default branches)"
+          if sum(values) == 0:
+            title = "Org commits (last 1500 days) — no data"
+          plt.title(title)
+          plt.tight_layout()
+          plt.savefig(out_png, dpi=150)
           PY
+
+          python __chart.py
+          rm -f __chart.py
+
+          # 5) Write markdown (no per-repo stats)
+          {
+            echo "# Organization Commit Insights"
+            echo
+            echo "**Org:** ${ORG_LABEL}  "
+            echo "**Commits period:** last 30 days (since ${SINCE_30D_DATE}, default branches)  "
+            if [[ "${COMPUTE_LOC}" == "true" ]]; then
+              echo "**LOC:** computed weekly for repos with commits > 0  "
+            else
+              echo "**LOC:** not computed  "
+            fi
+            echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo
+            echo "## Summary"
+            echo "- **Total commits (30d):** ${total_commits}"
+            echo "- **Repositories counted (commits):** ${processed}"
+            echo "- **Repositories skipped (commits):** ${skipped}"
+            echo "- **Active repos (commits > 0):** ${active_repos}"
+            echo "- **Total LOC (active repos only):** ${total_loc}"
+            echo "- **Repositories counted (LOC):** ${loc_counted}"
+            echo "- **Repositories skipped (LOC):** ${loc_skipped}"
+            echo
+            echo "![Org commits trend (last 1500 days)](${OUT_PNG})"
+          } > "${OUT_MD}"
+
+          # Cleanup transient files (keep chart + md only)
+          rm -f "${DATES_FILE}" "${ACTIVE_FILE}"
 
       - name: Commit & push report
         shell: bash
