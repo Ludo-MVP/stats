@@ -10,7 +10,6 @@ on:
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
-# ORG_NAME is the org login used for API (not display name)
 env:
   ORG_NAME: Ludo-MVP
 
@@ -46,7 +45,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install matplotlib
 
-          # LOC default ON: schedule always true; manual uses input default true
           COMPUTE_LOC="true"
           if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
             COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
@@ -64,12 +62,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          ORG_LOGIN="${ORG_NAME}"          # for API (org login)
-          ORG_LABEL="Ludo Labs AG"         # report display name (fixed)
+          ORG_LOGIN="${ORG_NAME}"
+          ORG_LABEL="Ludo Labs AG"
           OUT="commits.md"
           SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
-          # LOC default ON: schedule always true; manual uses input default true
           COMPUTE_LOC="true"
           if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
             COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
@@ -143,7 +140,6 @@ jobs:
             echo "${loc}"
           }
 
-          # throttle: Search commits is rate-limited
           for repo in "${REPOS[@]}"; do
             sleep 2.2
 
@@ -204,156 +200,154 @@ jobs:
           ACTIVE_FILE=".active_repos.txt"
           OUT_PNG="commits_1500d.png"
 
-          # If no active repos, write minimal chart and exit
           if [[ ! -s "${ACTIVE_FILE}" ]]; then
             cat > __chart_empty.py <<'PY'
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(12,4))
-            plt.plot([0],[0])
-            plt.title("Org commits (last 1500 days) — no active repos")
-            plt.tight_layout()
-            plt.savefig("commits_1500d.png", dpi=150)
-            PY
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12,4))
+plt.plot([0],[0])
+plt.title("Org commits (last 1500 days) - no active repos")
+plt.tight_layout()
+plt.savefig("commits_1500d.png", dpi=150)
+PY
             python __chart_empty.py
             rm -f __chart_empty.py
             exit 0
           fi
 
-          # Generate chart script (avoid heredoc into python to prevent EOF issues)
           cat > __chart_1500d.py <<'PY'
-          import json
-          import subprocess
-          from datetime import datetime, timedelta, timezone, date
-          from collections import defaultdict
-          
-          out_png = "commits_1500d.png"
-          
-          end_dt = datetime.now(timezone.utc)
-          start_dt = end_dt - timedelta(days=1500)
-          since_iso = start_dt.isoformat().replace("+00:00", "Z")
-          
-          with open(".active_repos.txt", "r", encoding="utf-8") as f:
-            repos = [line.strip() for line in f.read().splitlines() if line.strip()]
-          
-          def gh_graphql(query: str, variables: dict):
-            out = subprocess.check_output(
-              ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"],
-              text=True
-            )
-            return json.loads(out)
-          
-          q = r"""
-          query($owner:String!, $name:String!, $since:GitTimestamp!) {
-            repository(owner:$owner, name:$name) {
-              defaultBranchRef {
-                target {
-                  ... on Commit {
-                    history(since:$since, first:100) {
-                      pageInfo { hasNextPage endCursor }
-                      nodes { committedDate }
-                    }
-                  }
-                }
-              }
-            }
+import json
+import subprocess
+from datetime import datetime, timedelta, timezone, date
+from collections import defaultdict
+
+out_png = "commits_1500d.png"
+
+end_dt = datetime.now(timezone.utc)
+start_dt = end_dt - timedelta(days=1500)
+since_iso = start_dt.isoformat().replace("+00:00", "Z")
+
+with open(".active_repos.txt", "r", encoding="utf-8") as f:
+  repos = [line.strip() for line in f.read().splitlines() if line.strip()]
+
+def gh_graphql(query: str, variables: dict):
+  out = subprocess.check_output(
+    ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"],
+    text=True
+  )
+  return json.loads(out)
+
+q = r"""
+query($owner:String!, $name:String!, $since:GitTimestamp!) {
+  repository(owner:$owner, name:$name) {
+    defaultBranchRef {
+      target {
+        ... on Commit {
+          history(since:$since, first:100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { committedDate }
           }
-          """
-          
-          q_page = r"""
-          query($owner:String!, $name:String!, $since:GitTimestamp!, $after:String!) {
-            repository(owner:$owner, name:$name) {
-              defaultBranchRef {
-                target {
-                  ... on Commit {
-                    history(since:$since, first:100, after:$after) {
-                      pageInfo { hasNextPage endCursor }
-                      nodes { committedDate }
-                    }
-                  }
-                }
-              }
-            }
+        }
+      }
+    }
+  }
+}
+"""
+
+q_page = r"""
+query($owner:String!, $name:String!, $since:GitTimestamp!, $after:String!) {
+  repository(owner:$owner, name:$name) {
+    defaultBranchRef {
+      target {
+        ... on Commit {
+          history(since:$since, first:100, after:$after) {
+            pageInfo { hasNextPage endCursor }
+            nodes { committedDate }
           }
-          """
-          
-          weekly = defaultdict(int)
-          
-          def week_key(d: date) -> str:
-            monday = d - timedelta(days=d.weekday())
-            return monday.isoformat()
-          
-          def add_repo(owner: str, name: str):
-            data = gh_graphql(q, {"owner": owner, "name": name, "since": since_iso})
-            repo = (((data.get("data") or {}).get("repository")) or {})
-            dbr = repo.get("defaultBranchRef")
-            if not dbr:
-              return
-            target = dbr.get("target") or {}
-            hist = (target.get("history") or {})
-            nodes = hist.get("nodes") or []
-          
-            for n in nodes:
-              cd = n.get("committedDate")
-              if cd:
-                d = date.fromisoformat(cd[:10])
-                weekly[week_key(d)] += 1
-          
-            pi = hist.get("pageInfo") or {}
-            after = pi.get("endCursor")
-            while pi.get("hasNextPage"):
-              data2 = gh_graphql(q_page, {"owner": owner, "name": name, "since": since_iso, "after": after})
-              repo2 = (((data2.get("data") or {}).get("repository")) or {})
-              dbr2 = repo2.get("defaultBranchRef")
-              if not dbr2:
-                break
-              target2 = dbr2.get("target") or {}
-              hist2 = (target2.get("history") or {})
-              nodes2 = hist2.get("nodes") or []
-              for n in nodes2:
-                cd = n.get("committedDate")
-                if cd:
-                  d = date.fromisoformat(cd[:10])
-                  weekly[week_key(d)] += 1
-              pi = hist2.get("pageInfo") or {}
-              after = pi.get("endCursor")
-          
-          for full in repos:
-            if "/" not in full:
-              continue
-            owner, name = full.split("/", 1)
-            add_repo(owner, name)
-          
-          end_date = end_dt.date()
-          start_date = start_dt.date()
-          
-          start_monday = start_date - timedelta(days=start_date.weekday())
-          end_monday = end_date - timedelta(days=end_date.weekday())
-          
-          labels = []
-          values = []
-          cur = start_monday
-          while cur <= end_monday:
-            k = cur.isoformat()
-            labels.append(k)
-            values.append(int(weekly.get(k, 0)))
-            cur += timedelta(days=7)
-          
-          import matplotlib.pyplot as plt
-          plt.figure(figsize=(12,4))
-          plt.plot(range(len(values)), values)
-          
-          step = max(1, len(labels)//12)
-          plt.xticks(
-            range(0, len(labels), step),
-            [labels[i] for i in range(0, len(labels), step)],
-            rotation=45,
-            ha="right"
-          )
-          plt.ylabel("Commits (weekly)")
-          plt.title("Org commits trend (last 1500 days, weekly, active repos, default branches)")
-          plt.tight_layout()
-          plt.savefig(out_png, dpi=150)
-          PY
+        }
+      }
+    }
+  }
+}
+"""
+
+weekly = defaultdict(int)
+
+def week_key(d: date) -> str:
+  monday = d - timedelta(days=d.weekday())
+  return monday.isoformat()
+
+def add_repo(owner: str, name: str):
+  data = gh_graphql(q, {"owner": owner, "name": name, "since": since_iso})
+  repo = (((data.get("data") or {}).get("repository")) or {})
+  dbr = repo.get("defaultBranchRef")
+  if not dbr:
+    return
+  target = dbr.get("target") or {}
+  hist = (target.get("history") or {})
+  nodes = hist.get("nodes") or []
+
+  for n in nodes:
+    cd = n.get("committedDate")
+    if cd:
+      d = date.fromisoformat(cd[:10])
+      weekly[week_key(d)] += 1
+
+  pi = hist.get("pageInfo") or {}
+  after = pi.get("endCursor")
+  while pi.get("hasNextPage"):
+    data2 = gh_graphql(q_page, {"owner": owner, "name": name, "since": since_iso, "after": after})
+    repo2 = (((data2.get("data") or {}).get("repository")) or {})
+    dbr2 = repo2.get("defaultBranchRef")
+    if not dbr2:
+      break
+    target2 = dbr2.get("target") or {}
+    hist2 = (target2.get("history") or {})
+    nodes2 = hist2.get("nodes") or []
+    for n in nodes2:
+      cd = n.get("committedDate")
+      if cd:
+        d = date.fromisoformat(cd[:10])
+        weekly[week_key(d)] += 1
+    pi = hist2.get("pageInfo") or {}
+    after = pi.get("endCursor")
+
+for full in repos:
+  if "/" not in full:
+    continue
+  owner, name = full.split("/", 1)
+  add_repo(owner, name)
+
+end_date = end_dt.date()
+start_date = start_dt.date()
+
+start_monday = start_date - timedelta(days=start_date.weekday())
+end_monday = end_date - timedelta(days=end_date.weekday())
+
+labels = []
+values = []
+cur = start_monday
+while cur <= end_monday:
+  k = cur.isoformat()
+  labels.append(k)
+  values.append(int(weekly.get(k, 0)))
+  cur += timedelta(days=7)
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12,4))
+plt.plot(range(len(values)), values)
+
+step = max(1, len(labels)//12)
+plt.xticks(
+  range(0, len(labels), step),
+  [labels[i] for i in range(0, len(labels), step)],
+  rotation=45,
+  ha="right"
+)
+plt.ylabel("Commits (weekly)")
+plt.title("Org commits trend (last 1500 days, weekly, active repos, default branches)")
+plt.tight_layout()
+plt.savefig(out_png, dpi=150)
+PY
 
           python __chart_1500d.py
           rm -f __chart_1500d.py
@@ -366,7 +360,6 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          # Commit only report artifacts (do NOT commit temp files)
           git add commits.md commits_1500d.png || true
 
           if git diff --cached --quiet; then
@@ -378,5 +371,4 @@ jobs:
           git commit -m "Update org commit insights (30d summary + LOC + 1500d chart)"
           git push
 
-          # Cleanup temp file
           rm -f .active_repos.txt
