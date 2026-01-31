@@ -1,7 +1,12 @@
-name: Org Commit Insights (last 30 days, per repo, Markdown)
+name: Org Commit Insights (30d commits + weekly LOC for active repos, Markdown)
 
 on:
   workflow_dispatch:
+    inputs:
+      compute_loc:
+        description: "Compute LOC (true/false). Default false for manual runs."
+        required: false
+        default: "false"
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
@@ -25,9 +30,6 @@ jobs:
       - name: Verify gh is available
         run: gh --version
 
-      # Requires secrets:
-      # - GH_APP_ID
-      # - GH_APP_PRIVATE_KEY (full PEM content)
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -36,7 +38,15 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ env.ORG_NAME }}
 
-      - name: Generate Markdown report (last 30 days)
+      - name: Install cloc (only when LOC is enabled)
+        if: ${{ github.event_name == 'schedule' || inputs.compute_loc == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y cloc
+
+      - name: Generate Markdown report
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
@@ -47,37 +57,58 @@ jobs:
           OUT="commits.md"
           SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
-          # List all org repos, but EXCLUDE the repo that hosts this workflow ("stats" repo)
+          # LOC computed on schedule by default; manual runs can enable via input.
+          COMPUTE_LOC="false"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            COMPUTE_LOC="true"
+          else
+            COMPUTE_LOC="${{ inputs.compute_loc || 'false' }}"
+          fi
+
           SELF_REPO="${GITHUB_REPOSITORY}"
+
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
               --jq '.[] | select(.fork==false and .archived==false) | .full_name' \
             | grep -v -F "${SELF_REPO}" || true
           )
 
-          total=0
+          total_commits=0
           processed=0
           skipped=0
+
+          total_loc=0
+          loc_counted=0
+          loc_skipped=0
+          active_repos=0
 
           {
             echo "# Organization Commit Insights"
             echo
             echo "**Org:** ${ORG}  "
-            echo "**Period:** last 30 days (since ${SINCE}, all branches)  "
+            echo "**Commits period:** last 30 days (since ${SINCE}, all branches)  "
+            echo "**LOC:** $([[ "${COMPUTE_LOC}" == "true" ]] && echo "computed weekly for repos with commits > 0" || echo "not computed")  "
             echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
             echo
             echo "## Summary"
-            echo "- **Total commits:** (computing...)"
-            echo "- **Repositories counted:** (computing...)"
-            echo "- **Repositories skipped:** (computing...)"
+            echo "- **Total commits (30d):** (computing...)"
+            echo "- **Repositories counted (commits):** (computing...)"
+            echo "- **Repositories skipped (commits):** (computing...)"
+            echo "- **Active repos (commits > 0):** (computing...)"
+            echo "- **Total LOC (active repos only):** (computing...)"
+            echo "- **Repositories counted (LOC):** (computing...)"
+            echo "- **Repositories skipped (LOC):** (computing...)"
             echo
             echo "## Commits by repository"
-            echo "| Repository | Commits |"
-            echo "|-----------|--------:|"
+            if [[ "${COMPUTE_LOC}" == "true" ]]; then
+              echo "| Repository | Commits (30d) | LOC (active only) |"
+              echo "|-----------|--------------:|-----------------:|"
+            else
+              echo "| Repository | Commits (30d) |"
+              echo "|-----------|--------------:|"
+            fi
           } > "${OUT}"
 
-          # Helper: query Search Commits API for a single repo with retries
-          # Search API is rate-limited (typically 30 req/min). We throttle.
           get_repo_commit_count() {
             local repo="$1"
             local since="$2"
@@ -87,7 +118,6 @@ jobs:
             while (( tries < max_tries )); do
               tries=$((tries+1))
 
-              # Search commits requires this preview Accept header.
               local resp status body
               resp="$(gh api -i -H "Accept: application/vnd.github.cloak-preview+json" \
                 "/search/commits?q=repo:${repo}+committer-date:>=${since}&per_page=1" 2>/dev/null || true)"
@@ -113,36 +143,70 @@ jobs:
             return 1
           }
 
+          get_repo_loc() {
+            local repo="$1"
+            local dir="__repo_tmp_${RANDOM}_${RANDOM}"
+
+            git clone --quiet --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" "${dir}" || return 1
+
+            local loc
+            loc="$(cloc "${dir}" --json --quiet 2>/dev/null | jq -r '.SUM.code // 0' || echo 0)"
+
+            rm -rf "${dir}"
+            echo "${loc}"
+          }
+
+          # Throttle to respect Search API rate limits (~30 req/min)
+          # 2.2s => ~27 req/min
           for repo in "${REPOS[@]}"; do
-            # Throttle to stay under Search API limits
             sleep 2.2
 
             c="$(get_repo_commit_count "${repo}" "${SINCE}" || true)"
-
-            if [[ -z "${c}" ]]; then
-              skipped=$((skipped+1))
-              continue
-            fi
-
-            if ! [[ "${c}" =~ ^[0-9]+$ ]]; then
+            if [[ -z "${c}" ]] || ! [[ "${c}" =~ ^[0-9]+$ ]]; then
               skipped=$((skipped+1))
               continue
             fi
 
             processed=$((processed+1))
-            total=$((total + c))
+            total_commits=$((total_commits + c))
 
-            printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
+            if (( c > 0 )); then
+              active_repos=$((active_repos+1))
+            fi
+
+            if [[ "${COMPUTE_LOC}" == "true" ]]; then
+              if (( c > 0 )); then
+                loc=""
+                loc="$(get_repo_loc "${repo}" || true)"
+                if [[ -z "${loc}" ]] || ! [[ "${loc}" =~ ^[0-9]+$ ]]; then
+                  loc_skipped=$((loc_skipped+1))
+                  loc="0"
+                else
+                  loc_counted=$((loc_counted+1))
+                  total_loc=$((total_loc + loc))
+                fi
+                printf "| %s | %s | %s |\n" "${repo}" "${c}" "${loc}" >> "${OUT}"
+              else
+                # inactive repo: LOC not computed, show empty or dash
+                printf "| %s | %s | - |\n" "${repo}" "${c}" >> "${OUT}"
+              fi
+            else
+              printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
+            fi
           done
 
           perl -0777 -i -pe \
-            "s/- \\*\\*Total commits:\\*\\* \\(computing\\...\\)/- **Total commits:** ${total}/g;
-             s/- \\*\\*Repositories counted:\\*\\* \\(computing\\...\\)/- **Repositories counted:** ${processed}/g;
-             s/- \\*\\*Repositories skipped:\\*\\* \\(computing\\...\\)/- **Repositories skipped:** ${skipped}/g" \
+            "s/- \\*\\*Total commits \\(30d\\):\\*\\* \\(computing\\...\\)/- **Total commits (30d):** ${total_commits}/g;
+             s/- \\*\\*Repositories counted \\(commits\\):\\*\\* \\(computing\\...\\)/- **Repositories counted (commits):** ${processed}/g;
+             s/- \\*\\*Repositories skipped \\(commits\\):\\*\\* \\(computing\\...\\)/- **Repositories skipped (commits):** ${skipped}/g;
+             s/- \\*\\*Active repos \\(commits > 0\\):\\*\\* \\(computing\\...\\)/- **Active repos (commits > 0):** ${active_repos}/g;
+             s/- \\*\\*Total LOC \\(active repos only\\):\\*\\* \\(computing\\...\\)/- **Total LOC (active repos only):** ${total_loc}/g;
+             s/- \\*\\*Repositories counted \\(LOC\\):\\*\\* \\(computing\\...\\)/- **Repositories counted (LOC):** ${loc_counted}/g;
+             s/- \\*\\*Repositories skipped \\(LOC\\):\\*\\* \\(computing\\...\\)/- **Repositories skipped (LOC):** ${loc_skipped}/g" \
             "${OUT}"
 
           echo "Report written to ${OUT}"
-          head -n 40 "${OUT}"
+          head -n 80 "${OUT}"
 
       - name: Commit & push report
         shell: bash
@@ -158,5 +222,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update org commit insights (last 30 days)"
+          git commit -m "Update org commit insights (30d + weekly LOC active repos)"
           git push
