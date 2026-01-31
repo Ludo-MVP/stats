@@ -1,17 +1,18 @@
-name: Org Commit Insights (30d summary + weekly LOC + 1500d chart)
+name: Org Commit Insights (30d summary + weekly LOC default on + 1500d chart)
 
 on:
   workflow_dispatch:
     inputs:
       compute_loc:
-        description: "Compute LOC (true/false). Default false for manual runs."
+        description: "Compute LOC (true/false). Default true."
         required: false
         default: "true"
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
+# ORG_NAME is the org login used for API (not display name)
 env:
-  ORG_NAME: Ludo Labs AG
+  ORG_NAME: Ludo-MVP
 
 permissions:
   contents: write
@@ -38,37 +39,40 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ env.ORG_NAME }}
 
-      - name: Install deps (cloc optional, charts always)
+      - name: Install deps (charts always, cloc when LOC enabled)
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install matplotlib
 
-          # cloc only needed when LOC is enabled (schedule or manual input)
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" || "${{ inputs.compute_loc || 'false' }}" == "true" ]]; then
+          # LOC default ON: schedule always true; manual uses input default true
+          COMPUTE_LOC="true"
+          if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
+            COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
+          fi
+
+          if [[ "${COMPUTE_LOC}" == "true" ]]; then
             sudo apt-get update -y
             sudo apt-get install -y cloc
           fi
 
-      - name: Generate Markdown summary + optional LOC
+      - name: Generate Markdown summary + optional LOC (default on)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ORG_LOGIN="${ORG_NAME}"          # for API
-          ORG_LABEL="Ludo Labs AG"         # for report display (always fixed)
+          ORG_LOGIN="${ORG_NAME}"          # for API (org login)
+          ORG_LABEL="Ludo Labs AG"         # report display name (fixed)
           OUT="commits.md"
           SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
-          # LOC computed on schedule by default; manual runs can enable via input.
-          COMPUTE_LOC="false"
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            COMPUTE_LOC="true"
-          else
-            COMPUTE_LOC="${{ inputs.compute_loc || 'false' }}"
+          # LOC default ON: schedule always true; manual uses input default true
+          COMPUTE_LOC="true"
+          if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
+            COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
           fi
 
           SELF_REPO="${GITHUB_REPOSITORY}"
@@ -188,8 +192,6 @@ jobs:
             echo "![Org commits trend (last 1500 days)](commits_1500d.png)"
           } > "${OUT}"
 
-          echo "Active repos file: ${ACTIVE_FILE}"
-          wc -l "${ACTIVE_FILE}" || true
           echo "Summary written to ${OUT}"
 
       - name: Generate 1500-day chart (weekly bins, active repos, default branches)
@@ -203,7 +205,6 @@ jobs:
           OUT_PNG="commits_1500d.png"
 
           if [[ ! -s "${ACTIVE_FILE}" ]]; then
-            echo "No active repos -> generate empty chart."
             python - <<'PY'
             import matplotlib.pyplot as plt
             plt.figure(figsize=(12,4))
@@ -222,12 +223,10 @@ jobs:
 
           out_png = "commits_1500d.png"
 
-          # 1500 days window ending today (UTC)
           end_dt = datetime.now(timezone.utc)
           start_dt = end_dt - timedelta(days=1500)
           since_iso = start_dt.isoformat().replace("+00:00", "Z")
 
-          # Read active repos list
           repos = [line.strip() for line in open(".active_repos.txt", "r", encoding="utf-8").read().splitlines() if line.strip()]
 
           def gh_graphql(query: str, variables: dict):
@@ -271,11 +270,9 @@ jobs:
           }
           """
 
-          # Weekly bins: ISO week starting Monday
           weekly = defaultdict(int)
 
           def week_key(d: date) -> str:
-            # Monday of the week
             monday = d - timedelta(days=d.weekday())
             return monday.isoformat()
 
@@ -320,11 +317,9 @@ jobs:
             owner, name = full.split("/", 1)
             add_repo(owner, name)
 
-          # Build ordered weekly series covering the window
           end_date = end_dt.date()
           start_date = start_dt.date()
 
-          # Align start to Monday
           start_monday = start_date - timedelta(days=start_date.weekday())
           end_monday = end_date - timedelta(days=end_date.weekday())
 
@@ -337,7 +332,6 @@ jobs:
             values.append(int(weekly.get(k, 0)))
             cur += timedelta(days=7)
 
-          # Plot
           import matplotlib.pyplot as plt
           plt.figure(figsize=(12,4))
           plt.plot(range(len(values)), values)
@@ -350,21 +344,25 @@ jobs:
           plt.savefig(out_png, dpi=150)
           PY
 
-          echo "Chart written to ${OUT_PNG}"
-
       - name: Commit & push report
         shell: bash
         run: |
           set -euo pipefail
+
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          git add commits.md commits_1500d.png .active_repos.txt || true
+          # Commit only report artifacts (do NOT commit temp files)
+          git add commits.md commits_1500d.png || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
+            rm -f .active_repos.txt
             exit 0
           fi
 
-          git commit -m "Update org commit insights (30d summary + 1500d chart)"
+          git commit -m "Update org commit insights (30d summary + LOC + 1500d chart)"
           git push
+
+          # Cleanup temp file
+          rm -f .active_repos.txt
