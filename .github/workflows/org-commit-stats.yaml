@@ -193,46 +193,39 @@ jobs:
         run: |
           set -euo pipefail
 
-          SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
-          UNTIL="$(date -u +%Y-%m-%d)"
           OUT_MD="commits.md"
           OUT_PNG="commits_30d.png"
 
-          # Build day list (UTC)
           python - <<'PY'
           import os, subprocess, json
           from datetime import datetime, timedelta, timezone
 
           org = os.environ["ORG_LOGIN"]
-          since = os.environ.get("SINCE")
-          until = os.environ.get("UNTIL")
 
-          def sh(cmd):
-            return subprocess.check_output(cmd, text=True)
+          def gh_api(path: str) -> dict:
+            out = subprocess.check_output(
+              ["gh", "api", "-H", "Accept: application/vnd.github.cloak-preview+json", path],
+              text=True
+            )
+            return json.loads(out)
 
-          since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-          until_dt = datetime.strptime(until, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+          # last 30 full days including today in UTC
+          end = datetime.now(timezone.utc).date()
+          start = end - timedelta(days=29)
 
-          # We will count commits per day via Search API.
-          # To reduce payload, per_page=1 and take total_count.
-          # Note: Search API rate limits are low. 30 daily queries is OK weekly.
           days = []
-          cur = since_dt
-          while cur <= until_dt:
+          cur = start
+          while cur <= end:
             nxt = cur + timedelta(days=1)
-            q = f"/search/commits?q=org:{org}+committer-date:>={cur.date()}+committer-date:<{nxt.date()}&per_page=1"
-            # gh api with required Accept header for commit search
-            resp = sh(["gh","api","-H","Accept: application/vnd.github.cloak-preview+json", q])
-            total = json.loads(resp).get("total_count", 0)
-            days.append((cur.date().isoformat(), int(total)))
+            q = f"/search/commits?q=org:{org}+committer-date:>={cur.isoformat()}+committer-date:<{nxt.isoformat()}&per_page=1"
+            total = gh_api(q).get("total_count", 0)
+            days.append((cur.isoformat(), int(total)))
             cur = nxt
 
-          # Save as json for plotting
-          with open("commits_30d.json","w",encoding="utf-8") as f:
+          with open("commits_30d.json", "w", encoding="utf-8") as f:
             json.dump(days, f)
           PY
 
-          # Plot with matplotlib
           python - <<'PY'
           import json
           import matplotlib.pyplot as plt
@@ -243,23 +236,22 @@ jobs:
 
           plt.figure(figsize=(12,4))
           plt.plot(range(len(values)), values)
-          plt.xticks(range(0,len(labels), max(1, len(labels)//10)), [labels[i] for i in range(0,len(labels), max(1, len(labels)//10))], rotation=45, ha="right")
+          step = max(1, len(labels)//10)
+          plt.xticks(range(0, len(labels), step), [labels[i] for i in range(0, len(labels), step)], rotation=45, ha="right")
           plt.ylabel("Commits")
           plt.title("Org commits per day (last 30 days)")
           plt.tight_layout()
           plt.savefig("commits_30d.png", dpi=150)
           PY
 
-          # Insert chart near the top (after the header block)
-          # If already embedded, replace the image line.
+          # Embed (or replace) image line in Markdown
           if grep -qE '^!\[Org commits per day' "${OUT_MD}"; then
             perl -i -pe 's/^!\[Org commits per day.*$/![Org commits per day (last 30 days)](commits_30d.png)/' "${OUT_MD}"
           else
-            # Insert after the first blank line following the title
             perl -0777 -i -pe 's/(# Organization Commit Insights\n\n)/$1![Org commits per day (last 30 days)](commits_30d.png)\n\n/' "${OUT_MD}"
           fi
 
-          echo "Chart written to commits_30d.png and embedded into commits.md"
+          echo "Chart written to ${OUT_PNG} and embedded into ${OUT_MD}"
 
       - name: Commit & push report
         shell: bash
