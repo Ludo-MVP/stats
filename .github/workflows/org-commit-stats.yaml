@@ -1,4 +1,4 @@
-name: Org Commit Insights (1500d commits + weekly LOC, summary-only)
+name: Org Commit Insights (30d summary + weekly LOC + 1500d chart)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
 env:
-  ORG_NAME: Ludo-MVP
+  ORG_NAME: Ludo Labs AG
 
 permissions:
   contents: write
@@ -38,15 +38,20 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ env.ORG_NAME }}
 
-      - name: Install cloc (only when LOC is enabled)
-        if: ${{ github.event_name == 'schedule' || inputs.compute_loc == 'true' }}
+      - name: Install deps (cloc optional, charts always)
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y cloc
+          python -m pip install --upgrade pip
+          pip install matplotlib
 
-      - name: Generate Markdown report (summary-only)
+          # cloc only needed when LOC is enabled (schedule or manual input)
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" || "${{ inputs.compute_loc || 'false' }}" == "true" ]]; then
+            sudo apt-get update -y
+            sudo apt-get install -y cloc
+          fi
+
+      - name: Generate Markdown summary + optional LOC
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
@@ -56,7 +61,7 @@ jobs:
           ORG_LOGIN="${ORG_NAME}"          # for API
           ORG_LABEL="Ludo Labs AG"         # for report display (always fixed)
           OUT="commits.md"
-          SINCE="$(date -u -d '1500 days ago' +%Y-%m-%d)"
+          SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
           # LOC computed on schedule by default; manual runs can enable via input.
           COMPUTE_LOC="false"
@@ -68,10 +73,6 @@ jobs:
 
           SELF_REPO="${GITHUB_REPOSITORY}"
 
-          # Fetch repos and apply filters:
-          # - exclude forks and archived
-          # - exclude the current repo running the workflow
-          # - exclude any repo whose name contains "backup" (case-insensitive)
           mapfile -t REPOS < <(
             gh api "orgs/${ORG_LOGIN}/repos?per_page=100" --paginate \
               --jq '.[] | select(.fork==false and .archived==false) | .full_name' \
@@ -87,6 +88,9 @@ jobs:
           total_loc=0
           loc_counted=0
           loc_skipped=0
+
+          ACTIVE_FILE=".active_repos.txt"
+          : > "${ACTIVE_FILE}"
 
           get_repo_commit_count() {
             local repo="$1"
@@ -135,8 +139,7 @@ jobs:
             echo "${loc}"
           }
 
-          # Throttle to respect Search API rate limits (~30 req/min)
-          # 2.2s => ~27 req/min
+          # throttle: Search commits is rate-limited
           for repo in "${REPOS[@]}"; do
             sleep 2.2
 
@@ -151,6 +154,7 @@ jobs:
 
             if (( c > 0 )); then
               active_repos=$((active_repos+1))
+              echo "${repo}" >> "${ACTIVE_FILE}"
 
               if [[ "${COMPUTE_LOC}" == "true" ]]; then
                 loc="$(get_repo_loc "${repo}" || true)"
@@ -168,90 +172,185 @@ jobs:
             echo "# Organization Commit Insights"
             echo
             echo "**Org:** ${ORG_LABEL}  "
-            echo "**Commits period:** last 1500 days (since ${SINCE}, all branches)  "
+            echo "**Commits period:** last 30 days (since ${SINCE}, all branches)  "
             echo "**LOC:** $([[ "${COMPUTE_LOC}" == "true" ]] && echo "computed weekly for repos with commits > 0" || echo "not computed")  "
             echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
             echo
             echo "## Summary"
-            echo "- **Total commits (1500d):** ${total_commits}"
+            echo "- **Total commits (30d):** ${total_commits}"
             echo "- **Repositories counted (commits):** ${processed}"
             echo "- **Repositories skipped (commits):** ${skipped}"
             echo "- **Active repos (commits > 0):** ${active_repos}"
             echo "- **Total LOC (active repos only):** ${total_loc}"
             echo "- **Repositories counted (LOC):** ${loc_counted}"
             echo "- **Repositories skipped (LOC):** ${loc_skipped}"
+            echo
+            echo "![Org commits trend (last 1500 days)](commits_1500d.png)"
           } > "${OUT}"
 
-          echo "Report written to ${OUT}"
-          cat "${OUT}"
+          echo "Active repos file: ${ACTIVE_FILE}"
+          wc -l "${ACTIVE_FILE}" || true
+          echo "Summary written to ${OUT}"
 
-      - name: Generate charts (PNG) and embed into Markdown
+      - name: Generate 1500-day chart (weekly bins, active repos, default branches)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          ORG_LOGIN: ${{ env.ORG_NAME }}
         shell: bash
         run: |
           set -euo pipefail
 
-          OUT_MD="commits.md"
-          OUT_PNG="commits_30d.png"
+          ACTIVE_FILE=".active_repos.txt"
+          OUT_PNG="commits_1500d.png"
+
+          if [[ ! -s "${ACTIVE_FILE}" ]]; then
+            echo "No active repos -> generate empty chart."
+            python - <<'PY'
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(12,4))
+            plt.plot([0],[0])
+            plt.title("Org commits (last 1500 days) — no active repos")
+            plt.tight_layout()
+            plt.savefig("commits_1500d.png", dpi=150)
+            PY
+            exit 0
+          fi
 
           python - <<'PY'
-          import os, subprocess, json
-          from datetime import datetime, timedelta, timezone
+          import os, json, subprocess
+          from datetime import datetime, timedelta, timezone, date
+          from collections import defaultdict
 
-          org = os.environ["ORG_LOGIN"]
+          out_png = "commits_1500d.png"
 
-          def gh_api(path: str) -> dict:
+          # 1500 days window ending today (UTC)
+          end_dt = datetime.now(timezone.utc)
+          start_dt = end_dt - timedelta(days=1500)
+          since_iso = start_dt.isoformat().replace("+00:00", "Z")
+
+          # Read active repos list
+          repos = [line.strip() for line in open(".active_repos.txt", "r", encoding="utf-8").read().splitlines() if line.strip()]
+
+          def gh_graphql(query: str, variables: dict):
             out = subprocess.check_output(
-              ["gh", "api", "-H", "Accept: application/vnd.github.cloak-preview+json", path],
+              ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"],
               text=True
             )
             return json.loads(out)
 
-          # last 30 full days including today in UTC
-          end = datetime.now(timezone.utc).date()
-          start = end - timedelta(days=29)
+          q = r"""
+          query($owner:String!, $name:String!, $since:GitTimestamp!) {
+            repository(owner:$owner, name:$name) {
+              defaultBranchRef {
+                target {
+                  ... on Commit {
+                    history(since:$since, first:100) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { committedDate }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
 
-          days = []
-          cur = start
-          while cur <= end:
-            nxt = cur + timedelta(days=1)
-            q = f"/search/commits?q=org:{org}+committer-date:>={cur.isoformat()}+committer-date:<{nxt.isoformat()}&per_page=1"
-            total = gh_api(q).get("total_count", 0)
-            days.append((cur.isoformat(), int(total)))
-            cur = nxt
+          q_page = r"""
+          query($owner:String!, $name:String!, $since:GitTimestamp!, $after:String!) {
+            repository(owner:$owner, name:$name) {
+              defaultBranchRef {
+                target {
+                  ... on Commit {
+                    history(since:$since, first:100, after:$after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { committedDate }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
 
-          with open("commits_30d.json", "w", encoding="utf-8") as f:
-            json.dump(days, f)
-          PY
+          # Weekly bins: ISO week starting Monday
+          weekly = defaultdict(int)
 
-          python - <<'PY'
-          import json
+          def week_key(d: date) -> str:
+            # Monday of the week
+            monday = d - timedelta(days=d.weekday())
+            return monday.isoformat()
+
+          def add_repo(owner: str, name: str):
+            data = gh_graphql(q, {"owner": owner, "name": name, "since": since_iso})
+            repo = (((data.get("data") or {}).get("repository")) or {})
+            dbr = repo.get("defaultBranchRef")
+            if not dbr:
+              return
+            target = dbr.get("target") or {}
+            hist = (target.get("history") or {})
+            nodes = hist.get("nodes") or []
+
+            for n in nodes:
+              cd = n.get("committedDate")
+              if cd:
+                d = date.fromisoformat(cd[:10])
+                weekly[week_key(d)] += 1
+
+            pi = hist.get("pageInfo") or {}
+            after = pi.get("endCursor")
+            while pi.get("hasNextPage"):
+              data2 = gh_graphql(q_page, {"owner": owner, "name": name, "since": since_iso, "after": after})
+              repo2 = (((data2.get("data") or {}).get("repository")) or {})
+              dbr2 = repo2.get("defaultBranchRef")
+              if not dbr2:
+                break
+              target2 = dbr2.get("target") or {}
+              hist2 = (target2.get("history") or {})
+              nodes2 = hist2.get("nodes") or []
+              for n in nodes2:
+                cd = n.get("committedDate")
+                if cd:
+                  d = date.fromisoformat(cd[:10])
+                  weekly[week_key(d)] += 1
+              pi = hist2.get("pageInfo") or {}
+              after = pi.get("endCursor")
+
+          for full in repos:
+            if "/" not in full:
+              continue
+            owner, name = full.split("/", 1)
+            add_repo(owner, name)
+
+          # Build ordered weekly series covering the window
+          end_date = end_dt.date()
+          start_date = start_dt.date()
+
+          # Align start to Monday
+          start_monday = start_date - timedelta(days=start_date.weekday())
+          end_monday = end_date - timedelta(days=end_date.weekday())
+
+          labels = []
+          values = []
+          cur = start_monday
+          while cur <= end_monday:
+            k = cur.isoformat()
+            labels.append(k)
+            values.append(int(weekly.get(k, 0)))
+            cur += timedelta(days=7)
+
+          # Plot
           import matplotlib.pyplot as plt
-
-          data = json.load(open("commits_30d.json","r",encoding="utf-8"))
-          labels = [d[0] for d in data]
-          values = [d[1] for d in data]
-
           plt.figure(figsize=(12,4))
           plt.plot(range(len(values)), values)
-          step = max(1, len(labels)//10)
+
+          step = max(1, len(labels)//12)
           plt.xticks(range(0, len(labels), step), [labels[i] for i in range(0, len(labels), step)], rotation=45, ha="right")
-          plt.ylabel("Commits")
-          plt.title("Org commits per day (last 30 days)")
+          plt.ylabel("Commits (weekly)")
+          plt.title("Org commits trend (last 1500 days, weekly, active repos, default branches)")
           plt.tight_layout()
-          plt.savefig("commits_30d.png", dpi=150)
+          plt.savefig(out_png, dpi=150)
           PY
 
-          # Embed (or replace) image line in Markdown
-          if grep -qE '^!\[Org commits per day' "${OUT_MD}"; then
-            perl -i -pe 's/^!\[Org commits per day.*$/![Org commits per day (last 30 days)](commits_30d.png)/' "${OUT_MD}"
-          else
-            perl -0777 -i -pe 's/(# Organization Commit Insights\n\n)/$1![Org commits per day (last 30 days)](commits_30d.png)\n\n/' "${OUT_MD}"
-          fi
-
-          echo "Chart written to ${OUT_PNG} and embedded into ${OUT_MD}"
+          echo "Chart written to ${OUT_PNG}"
 
       - name: Commit & push report
         shell: bash
@@ -260,12 +359,12 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          git add commits.md
+          git add commits.md commits_1500d.png .active_repos.txt || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Update org commit insights (1500d + weekly LOC, summary-only)"
+          git commit -m "Update org commit insights (30d summary + 1500d chart)"
           git push
