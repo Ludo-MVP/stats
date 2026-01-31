@@ -45,17 +45,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install matplotlib
 
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
           COMPUTE_LOC="true"
           if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
             COMPUTE_LOC="${{ inputs.compute_loc || 'true' }}"
           fi
 
           if [[ "${COMPUTE_LOC}" == "true" ]]; then
-            sudo apt-get update -y
-            sudo apt-get install -y cloc jq
-          else
-            sudo apt-get update -y
-            sudo apt-get install -y jq
+            sudo apt-get install -y cloc
           fi
 
       - name: Generate report (Markdown + optional LOC + 1500d chart)
@@ -104,43 +103,39 @@ jobs:
             r = sh(["gh"] + cmd, check=check)
             return r.stdout
 
-          def gh_json(cmd, check=True):
-            return json.loads(gh(cmd, check=check))
+          def gh_graphql(query: str, variables: dict):
+            out = gh(["api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"])
+            return json.loads(out)
 
           def list_accessible_repos():
-            # Critical fix: list only repos accessible to the GitHub App installation token
-            # This avoids "Resource not accessible by integration"
-            repos = []
-            data = gh(["api", "installation/repositories?per_page=100", "--paginate"])
-            j = json.loads(data)
-            # gh merges pagination; result may be dict with "repositories" or a list (edge cases)
-            if isinstance(j, dict) and "repositories" in j:
-              items = j["repositories"]
-            elif isinstance(j, list):
-              items = []
-              for page in j:
-                if isinstance(page, dict) and "repositories" in page:
-                  items.extend(page["repositories"])
-            else:
-              items = []
+            # Critical fix: use --jq with --paginate to emit one repo per line (safe streaming output).
+            # This avoids JSON "Extra data" errors from concatenated pages.
+            out = gh([
+              "api",
+              "installation/repositories?per_page=100",
+              "--paginate",
+              "--jq",
+              ".repositories[].full_name"
+            ])
+            repos = [line.strip() for line in out.splitlines() if line.strip()]
 
-            for r in items:
-              full = (r.get("full_name") or "").strip()
-              name = (r.get("name") or "").strip()
-              if not full or "/" not in full:
+            filtered = []
+            for full in repos:
+              if "/" not in full:
                 continue
+              name = full.split("/", 1)[1]
+
               if SELF_REPO and full.lower() == SELF_REPO:
                 continue
               if name.lower() == "stats" or full.lower().endswith("/stats"):
                 continue
               if "backup" in name.lower() or "backup" in full.lower():
                 continue
-              repos.append(full)
-            return sorted(set(repos))
 
-          def gh_graphql(query: str, variables: dict):
-            out = gh(["api", "graphql", "-f", f"query={query}", "-f", f"variables={json.dumps(variables)}"])
-            return json.loads(out)
+              filtered.append(full)
+
+            # de-dup and stable order
+            return sorted(set(filtered))
 
           Q_COMMITS_30D = r"""
           query($owner:String!, $name:String!, $since:GitTimestamp!) {
@@ -218,6 +213,7 @@ jobs:
               target = dbr.get("target") or {}
               hist = target.get("history") or {}
               nodes = hist.get("nodes") or []
+
               for n in nodes:
                 cd = n.get("committedDate")
                 if cd:
@@ -272,7 +268,6 @@ jobs:
             total_commits = 0
             active_repos = []
 
-            # commits over last 30 days on default branches (stable, avoids Search API rate limiting)
             for repo in repos:
               try:
                 c = commits_last_30d(repo)
@@ -283,7 +278,6 @@ jobs:
               except Exception:
                 skipped += 1
 
-            # LOC for active repos only (default ON)
             total_loc = 0
             loc_counted = 0
             loc_skipped = 0
@@ -296,7 +290,6 @@ jobs:
                 else:
                   loc_skipped += 1
 
-            # 1500d chart from active repos only
             weekly = defaultdict(int)
             for repo in active_repos:
               try:
