@@ -1,4 +1,4 @@
-name: Org Commit Insights (30d commits + weekly LOC for active repos, Markdown)
+name: Org Commit Insights (30d commits + weekly LOC, summary-only)
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
+# ORG_NAME is the org login used for API (not display name)
 env:
   ORG_NAME: Ludo-MVP
 
@@ -46,14 +47,15 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y cloc
 
-      - name: Generate Markdown report
+      - name: Generate Markdown report (summary-only)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ORG="${ORG_NAME}"
+          ORG_LOGIN="${ORG_NAME}"          # for API
+          ORG_LABEL="Ludo Labs AG"         # for report display (always fixed)
           OUT="commits.md"
           SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
@@ -67,47 +69,25 @@ jobs:
 
           SELF_REPO="${GITHUB_REPOSITORY}"
 
+          # Fetch repos and apply filters:
+          # - exclude forks and archived
+          # - exclude the current repo running the workflow
+          # - exclude any repo whose name contains "backup" (case-insensitive)
           mapfile -t REPOS < <(
-            gh api "orgs/${ORG}/repos?per_page=100" --paginate \
+            gh api "orgs/${ORG_LOGIN}/repos?per_page=100" --paginate \
               --jq '.[] | select(.fork==false and .archived==false) | .full_name' \
-            | grep -v -F "${SELF_REPO}" || true
+            | grep -v -F "${SELF_REPO}" \
+            | grep -vi 'backup' || true
           )
 
           total_commits=0
           processed=0
           skipped=0
+          active_repos=0
 
           total_loc=0
           loc_counted=0
           loc_skipped=0
-          active_repos=0
-
-          {
-            echo "# Organization Commit Insights"
-            echo
-            echo "**Org:** ${ORG}  "
-            echo "**Commits period:** last 30 days (since ${SINCE}, all branches)  "
-            echo "**LOC:** $([[ "${COMPUTE_LOC}" == "true" ]] && echo "computed weekly for repos with commits > 0" || echo "not computed")  "
-            echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
-            echo
-            echo "## Summary"
-            echo "- **Total commits (30d):** (computing...)"
-            echo "- **Repositories counted (commits):** (computing...)"
-            echo "- **Repositories skipped (commits):** (computing...)"
-            echo "- **Active repos (commits > 0):** (computing...)"
-            echo "- **Total LOC (active repos only):** (computing...)"
-            echo "- **Repositories counted (LOC):** (computing...)"
-            echo "- **Repositories skipped (LOC):** (computing...)"
-            echo
-            echo "## Commits by repository"
-            if [[ "${COMPUTE_LOC}" == "true" ]]; then
-              echo "| Repository | Commits (30d) | LOC (active only) |"
-              echo "|-----------|--------------:|-----------------:|"
-            else
-              echo "| Repository | Commits (30d) |"
-              echo "|-----------|--------------:|"
-            fi
-          } > "${OUT}"
 
           get_repo_commit_count() {
             local repo="$1"
@@ -172,41 +152,39 @@ jobs:
 
             if (( c > 0 )); then
               active_repos=$((active_repos+1))
-            fi
 
-            if [[ "${COMPUTE_LOC}" == "true" ]]; then
-              if (( c > 0 )); then
-                loc=""
+              if [[ "${COMPUTE_LOC}" == "true" ]]; then
                 loc="$(get_repo_loc "${repo}" || true)"
                 if [[ -z "${loc}" ]] || ! [[ "${loc}" =~ ^[0-9]+$ ]]; then
                   loc_skipped=$((loc_skipped+1))
-                  loc="0"
                 else
                   loc_counted=$((loc_counted+1))
                   total_loc=$((total_loc + loc))
                 fi
-                printf "| %s | %s | %s |\n" "${repo}" "${c}" "${loc}" >> "${OUT}"
-              else
-                # inactive repo: LOC not computed, show empty or dash
-                printf "| %s | %s | - |\n" "${repo}" "${c}" >> "${OUT}"
               fi
-            else
-              printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
             fi
           done
 
-          perl -0777 -i -pe \
-            "s/- \\*\\*Total commits \\(30d\\):\\*\\* \\(computing\\...\\)/- **Total commits (30d):** ${total_commits}/g;
-             s/- \\*\\*Repositories counted \\(commits\\):\\*\\* \\(computing\\...\\)/- **Repositories counted (commits):** ${processed}/g;
-             s/- \\*\\*Repositories skipped \\(commits\\):\\*\\* \\(computing\\...\\)/- **Repositories skipped (commits):** ${skipped}/g;
-             s/- \\*\\*Active repos \\(commits > 0\\):\\*\\* \\(computing\\...\\)/- **Active repos (commits > 0):** ${active_repos}/g;
-             s/- \\*\\*Total LOC \\(active repos only\\):\\*\\* \\(computing\\...\\)/- **Total LOC (active repos only):** ${total_loc}/g;
-             s/- \\*\\*Repositories counted \\(LOC\\):\\*\\* \\(computing\\...\\)/- **Repositories counted (LOC):** ${loc_counted}/g;
-             s/- \\*\\*Repositories skipped \\(LOC\\):\\*\\* \\(computing\\...\\)/- **Repositories skipped (LOC):** ${loc_skipped}/g" \
-            "${OUT}"
+          {
+            echo "# Organization Commit Insights"
+            echo
+            echo "**Org:** ${ORG_LABEL}  "
+            echo "**Commits period:** last 30 days (since ${SINCE}, all branches)  "
+            echo "**LOC:** $([[ "${COMPUTE_LOC}" == "true" ]] && echo "computed weekly for repos with commits > 0" || echo "not computed")  "
+            echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo
+            echo "## Summary"
+            echo "- **Total commits (30d):** ${total_commits}"
+            echo "- **Repositories counted (commits):** ${processed}"
+            echo "- **Repositories skipped (commits):** ${skipped}"
+            echo "- **Active repos (commits > 0):** ${active_repos}"
+            echo "- **Total LOC (active repos only):** ${total_loc}"
+            echo "- **Repositories counted (LOC):** ${loc_counted}"
+            echo "- **Repositories skipped (LOC):** ${loc_skipped}"
+          } > "${OUT}"
 
           echo "Report written to ${OUT}"
-          head -n 80 "${OUT}"
+          cat "${OUT}"
 
       - name: Commit & push report
         shell: bash
@@ -222,5 +200,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update org commit insights (30d + weekly LOC active repos)"
+          git commit -m "Update org commit insights (30d + weekly LOC, summary-only)"
           git push
