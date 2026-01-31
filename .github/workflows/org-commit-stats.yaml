@@ -1,12 +1,7 @@
-name: Org Commit Insights (Markdown + Pages)
+name: Org Commit Insights (last 30 days, per repo, Markdown)
 
 on:
   workflow_dispatch:
-    inputs:
-      weeks:
-        description: "Weeks to aggregate (4 ~= 28 days, 5 ~= 35 days)"
-        required: false
-        default: "48"
   schedule:
     - cron: "0 6 * * 1" # every Monday 06:00 UTC
 
@@ -27,9 +22,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # GitHub-hosted runners already have gh installed
       - name: Verify gh is available
         run: gh --version
 
+      # Requires secrets:
+      # - GH_APP_ID
+      # - GH_APP_PRIVATE_KEY  (full PEM content)
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -38,7 +37,7 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: ${{ env.ORG_NAME }}
 
-      - name: Generate Markdown report (all branches)
+      - name: Generate Markdown report (last 30 days)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
@@ -46,11 +45,12 @@ jobs:
           set -euo pipefail
 
           ORG="${ORG_NAME}"
-          WEEKS="${{ inputs.weeks || '5' }}"
           OUT="docs/insights/commits.md"
+          SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
           mkdir -p docs/insights
 
+          # List all repos visible to the App token (includes private)
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
               --jq '.[] | select(.fork==false and .archived==false) | .full_name'
@@ -60,12 +60,11 @@ jobs:
           processed=0
           skipped=0
 
-          # Write header
           {
             echo "# Organization Commit Insights"
             echo
             echo "**Org:** ${ORG}  "
-            echo "**Period:** last ${WEEKS} weeks (all branches)  "
+            echo "**Period:** last 30 days (since ${SINCE}, all branches)  "
             echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M UTC")"
             echo
             echo "## Summary"
@@ -78,50 +77,77 @@ jobs:
             echo "|-----------|--------:|"
           } > "${OUT}"
 
-          for repo in "${REPOS[@]}"; do
-            data=""
+          # Helper: query Search Commits API for a single repo with retries
+          # Note: REST Search is rate-limited (typically 30 req/min). We throttle.
+          get_repo_commit_count() {
+            local repo="$1"
+            local since="$2"
+            local tries=0
+            local max_tries=6
 
-            # /stats endpoints may return 202 while GitHub generates stats
-            for i in 1 2 3 4 5 6 7 8; do
-              resp="$(gh api -i "repos/${repo}/stats/commit_activity" 2>/dev/null || true)"
-              status="$(printf "%s" "$resp" | head -n 1 | awk "{print \$2}")"
-              body="$(printf "%s" "$resp" | sed -n '1{/^\r\{0,1\}$/q};1,/\r\{0,1\}$/d;p')"
+            while (( tries < max_tries )); do
+              tries=$((tries+1))
 
-              if [[ "${status}" == "200" ]]; then
-                data="${body}"
-                break
+              # Request headers + body so we can detect rate limiting and status
+              # Search commits requires this preview Accept header.
+              local resp status body
+              resp="$(gh api -i -H "Accept: application/vnd.github.cloak-preview+json" \
+                "/search/commits?q=repo:${repo}+committer-date:>=${since}&per_page=1" 2>/dev/null || true)"
+
+              status="$(printf "%s" "$resp" | head -n 1 | awk '{print $2}')"
+              body="$(printf "%s" "$resp" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
+
+              if [[ "$status" == "200" ]]; then
+                # total_count is what we need; per_page=1 keeps payload tiny
+                echo "$body" | jq -r '.total_count // 0' 2>/dev/null || echo 0
+                return 0
               fi
 
-              if [[ "${status}" == "202" ]]; then
-                sleep 3
+              # 403 can be rate limit; backoff and retry
+              if [[ "$status" == "403" ]]; then
+                sleep $((10 * tries))
                 continue
               fi
 
-              data=""
-              break
+              # 422/404/etc -> treat as skipped
+              echo ""
+              return 1
             done
 
-            if [[ -z "${data}" ]]; then
+            echo ""
+            return 1
+          }
+
+          for repo in "${REPOS[@]}"; do
+            # Throttle to stay under Search API limits
+            # 2.2s => ~27 req/min, safe for 30 req/min
+            sleep 2.2
+
+            c="$(get_repo_commit_count "${repo}" "${SINCE}" || true)"
+
+            if [[ -z "${c}" ]]; then
               skipped=$((skipped+1))
               continue
             fi
 
-            jtype="$(echo "${data}" | jq -r 'type' 2>/dev/null || echo unknown)"
-            if [[ "${jtype}" != "array" ]]; then
+            # Ensure numeric
+            if ! [[ "${c}" =~ ^[0-9]+$ ]]; then
               skipped=$((skipped+1))
               continue
             fi
 
-            c="$(echo "${data}" | jq -r --argjson n "${WEEKS}" '[.[-($n):] | .[].total] | add // 0' 2>/dev/null || echo 0)"
-
-            total=$((total + c))
             processed=$((processed+1))
+            total=$((total + c))
 
             printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
           done
 
-          # Patch summary lines without awk single-quote blocks
-          perl -0777 -i -pe "s/- \\*\\*Total commits:\\*\\* \\(computing\\...\\)/- **Total commits:** ${total}/g; s/- \\*\\*Repositories counted:\\*\\* \\(computing\\...\\)/- **Repositories counted:** ${processed}/g; s/- \\*\\*Repositories skipped:\\*\\* \\(computing\\...\\)/- **Repositories skipped:** ${skipped}/g" "${OUT}"
+          # Patch summary placeholders
+          perl -0777 -i -pe \
+            "s/- \\*\\*Total commits:\\*\\* \\(computing\\...\\)/- **Total commits:** ${total}/g;
+             s/- \\*\\*Repositories counted:\\*\\* \\(computing\\...\\)/- **Repositories counted:** ${processed}/g;
+             s/- \\*\\*Repositories skipped:\\*\\* \\(computing\\...\\)/- **Repositories skipped:** ${skipped}/g" \
+            "${OUT}"
 
           echo "Report written to ${OUT}"
           head -n 40 "${OUT}"
@@ -140,5 +166,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Update org commit insights"
+          git commit -m "Update org commit insights (last 30 days)"
           git push
