@@ -57,14 +57,6 @@ jobs:
           fi
 
       - name: Generate report (Markdown + optional LOC + 1500d chart)
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          ORG_LOGIN: ${{ env.ORG_NAME }}
-          ORG_LABEL: "Ludo Labs AG"
-          # manual input default true, schedule always true
-          COMPUTE_LOC_INPUT: ${{ inputs.compute_loc || 'true' }}
-          EVENT_NAME: ${{ github.event_name }}
-          SELF_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -88,6 +80,13 @@ jobs:
           python -c "$PY_CODE" <<'EOF'
           EOF
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG_LOGIN: ${{ env.ORG_NAME }}
+          ORG_LABEL: "Ludo Labs AG"
+          # manual input default true, schedule always true
+          COMPUTE_LOC_INPUT: ${{ inputs.compute_loc || 'true' }}
+          EVENT_NAME: ${{ github.event_name }}
+          SELF_REPO: ${{ github.repository }}
           PY_CODE: |
             import os
             import json
