@@ -22,13 +22,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # GitHub-hosted runners already have gh installed
       - name: Verify gh is available
         run: gh --version
 
       # Requires secrets:
       # - GH_APP_ID
-      # - GH_APP_PRIVATE_KEY  (full PEM content)
+      # - GH_APP_PRIVATE_KEY (full PEM content)
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -45,15 +44,15 @@ jobs:
           set -euo pipefail
 
           ORG="${ORG_NAME}"
-          OUT="docs/insights/commits.md"
+          OUT="commits.md"
           SINCE="$(date -u -d '30 days ago' +%Y-%m-%d)"
 
-          mkdir -p docs/insights
-
-          # List all repos visible to the App token (includes private)
+          # List all org repos, but EXCLUDE the repo that hosts this workflow ("stats" repo)
+          SELF_REPO="${GITHUB_REPOSITORY}"
           mapfile -t REPOS < <(
             gh api "orgs/${ORG}/repos?per_page=100" --paginate \
-              --jq '.[] | select(.fork==false and .archived==false) | .full_name'
+              --jq '.[] | select(.fork==false and .archived==false) | .full_name' \
+            | grep -v -F "${SELF_REPO}" || true
           )
 
           total=0
@@ -78,7 +77,7 @@ jobs:
           } > "${OUT}"
 
           # Helper: query Search Commits API for a single repo with retries
-          # Note: REST Search is rate-limited (typically 30 req/min). We throttle.
+          # Search API is rate-limited (typically 30 req/min). We throttle.
           get_repo_commit_count() {
             local repo="$1"
             local since="$2"
@@ -88,7 +87,6 @@ jobs:
             while (( tries < max_tries )); do
               tries=$((tries+1))
 
-              # Request headers + body so we can detect rate limiting and status
               # Search commits requires this preview Accept header.
               local resp status body
               resp="$(gh api -i -H "Accept: application/vnd.github.cloak-preview+json" \
@@ -98,18 +96,15 @@ jobs:
               body="$(printf "%s" "$resp" | awk 'BEGIN{p=0} /^\r?$/{p=1;next} {if(p)print}')"
 
               if [[ "$status" == "200" ]]; then
-                # total_count is what we need; per_page=1 keeps payload tiny
                 echo "$body" | jq -r '.total_count // 0' 2>/dev/null || echo 0
                 return 0
               fi
 
-              # 403 can be rate limit; backoff and retry
               if [[ "$status" == "403" ]]; then
                 sleep $((10 * tries))
                 continue
               fi
 
-              # 422/404/etc -> treat as skipped
               echo ""
               return 1
             done
@@ -120,7 +115,6 @@ jobs:
 
           for repo in "${REPOS[@]}"; do
             # Throttle to stay under Search API limits
-            # 2.2s => ~27 req/min, safe for 30 req/min
             sleep 2.2
 
             c="$(get_repo_commit_count "${repo}" "${SINCE}" || true)"
@@ -130,7 +124,6 @@ jobs:
               continue
             fi
 
-            # Ensure numeric
             if ! [[ "${c}" =~ ^[0-9]+$ ]]; then
               skipped=$((skipped+1))
               continue
@@ -142,7 +135,6 @@ jobs:
             printf "| %s | %s |\n" "${repo}" "${c}" >> "${OUT}"
           done
 
-          # Patch summary placeholders
           perl -0777 -i -pe \
             "s/- \\*\\*Total commits:\\*\\* \\(computing\\...\\)/- **Total commits:** ${total}/g;
              s/- \\*\\*Repositories counted:\\*\\* \\(computing\\...\\)/- **Repositories counted:** ${processed}/g;
@@ -159,7 +151,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
 
-          git add docs/insights/commits.md
+          git add commits.md
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
