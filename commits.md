@@ -1,16 +1,16 @@
 # Organization Commit Insights
 
 **Org:** Ludo Labs AG  
-**Commits period:** last 30 days (since 2026-02-07, default branches)  
+**Commits period:** last 30 days (since 2026-02-14, default branches)  
 **LOC:** computed weekly for repos with commits > 0  
-**Generated:** 2026-03-09 07:01 UTC
+**Generated:** 2026-03-16 07:16 UTC
 
 ## Summary
 - **Total commits (30d):** 14
 - **Repositories counted (commits):** 133
 - **Repositories skipped (commits):** 1
 - **Active repos (commits > 0):** 14
-- **Total LOC (active repos only):** 413064
+- **Total LOC (active repos only):** 402911
 - **Repositories counted (LOC):** 14
 - **Repositories skipped (LOC):** 0
 
